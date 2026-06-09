@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Wed Aug 25 12:17:56 2021
-
-@author: xiaoyan
-"""
 
 import os
 import argparse
@@ -317,6 +312,98 @@ def predict_svm_xgb(args, model, x_test, y_test, path, method, fold, n, test_ids
     return y_pred, yhats, acc, rest_precision, focus_precision, rest_recall, focus_recall, correct_id_res, \
            incorrect_id_res, correct_id_foc, incorrect_id_foc
 
+
+
+def get_img_probs_for_ensemble(args, model, data_loader):
+    """
+    Get class probabilities from a PyTorch binary classifier.
+    This is used only for learning ensemble weights on the training fold.
+    It does not save files and does not use any test labels.
+    """
+    if args.cuda:
+        model.cuda()
+
+    model.eval()
+    y_true = []
+    y_prob = []
+
+    with torch.no_grad():
+        for x, y in data_loader:
+            yhats = model(to_gpu(args.cuda, x))
+            yhats = yhats.cpu().detach().numpy().reshape(-1)
+            prob = np.stack([1.0 - yhats, yhats], axis=1)
+            y_prob.append(prob)
+            y_true.append(y.numpy().reshape(-1))
+
+    y_prob = np.concatenate(y_prob, axis=0)
+    y_true = np.concatenate(y_true, axis=0)
+    return y_true, y_prob
+
+
+def apply_fixed_weight_ensemble(preds, y_true, weights):
+    """
+    Apply fixed ensemble weights to the current test fold.
+    Important: this function does NOT optimize weights using y_true.
+    It only evaluates fixed weights.
+    """
+    weights = np.asarray(weights, dtype=np.float64)
+    weights = weights / (weights.sum() + 1e-12)
+
+    preds = [np.asarray(p, dtype=np.float64) for p in preds]
+    y_prob = np.zeros_like(preds[0], dtype=np.float64)
+
+    for w, p in zip(weights, preds):
+        y_prob += w * p
+
+    y_pred = np.argmax(y_prob, axis=1)
+    y_true = np.asarray(y_true).reshape(-1)
+
+    acc = accuracy_score(y_true, y_pred)
+
+    rest_true = int(np.sum((y_true == 0) & (y_pred == 0)))
+    focus_false = int(np.sum((y_true == 0) & (y_pred == 1)))
+    focus_true = int(np.sum((y_true == 1) & (y_pred == 1)))
+    rest_false = int(np.sum((y_true == 1) & (y_pred == 0)))
+
+    return acc, y_pred.tolist(), rest_true, focus_false, focus_true, rest_false
+
+
+def optimal_wight_ensemble_no_test_leak(preds_train, y_train, preds_test, y_test):
+    """
+    Learn ensemble weights from the outer training fold only, then apply the
+    fixed weights to the outer test fold.
+
+    This replaces calls like:
+        optimal_wight_ensemble(preds_test, y_test)
+
+    because optimizing weights directly on y_test leaks test-label information.
+    """
+    y_train = np.asarray(y_train).reshape(-1)
+    n_models = len(preds_train)
+
+    def objective(weights):
+        acc, _, _, _, _, _ = apply_fixed_weight_ensemble(preds_train, y_train, weights)
+        return -acc
+
+    bounds = [(0.0, 1.0)] * n_models
+    result = differential_evolution(
+        objective,
+        bounds=bounds,
+        seed=0,
+        polish=True
+    )
+
+    weights = np.asarray(result.x, dtype=np.float64)
+    weights = weights / (weights.sum() + 1e-12)
+
+    acc, y_pred, rest_true, focus_false, focus_true, rest_false = apply_fixed_weight_ensemble(
+        preds_test,
+        y_test,
+        weights
+    )
+
+    return acc, y_pred, rest_true, focus_false, focus_true, rest_false, weights
+
 def train_model(model, train_loader, test_loader, num_epochs, path, method, fold, n):
     results_path = path + '{}/'.format(method) 
     if not os.path.exists(results_path):
@@ -573,7 +660,13 @@ def main(args,results_face, results_ecg):
                               dataset_224, batch_size=args.batch_size, sampler=train_subsampler)
             
             testset = torch.utils.data.Subset(dataset_224, test_ids.tolist())
-            test_loader_224 = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False) 
+            test_loader_224 = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False)
+
+            # Ordered training loader used only to learn ensemble weights.
+            # It is separate from train_loader_224, whose sampler is random.
+            ensemble_trainset_224 = torch.utils.data.Subset(dataset_224, train_ids.tolist())
+            ensemble_train_loader_224 = torch.utils.data.DataLoader(ensemble_trainset_224, batch_size=args.batch_size, shuffle=False)
+            y_train_ensemble_224 = y_224[train_ids]
             
             ### create train set and test set for svm
             x_train_224, y_train_224 = x_224[train_ids], y_224[train_ids]
@@ -671,11 +764,24 @@ def main(args,results_face, results_ecg):
             # print('y_test_224 == y_vgg ?', y_test_224==y_vgg_f)
             test_time_xgb= datetime.now() - train_time
             print('the testing time of method {} is {}'.format(method3, test_time_xgb))
+
+            # Learn optimized ensemble weights from the outer training fold only.
+            # The current test fold labels are used only for final evaluation.
+            _, prob_train_vgg_f = get_img_probs_for_ensemble(args, vgg_face, ensemble_train_loader_224)
+            if args.test:
+                with open(pk_svm_face, 'rb') as f1:
+                    svm_face = pickle.load(f1)
+                with open(pk_xgb_face, 'rb') as f2:
+                    xgb_face = pickle.load(f2)
+            prob_train_svm_f = svm_face.predict_proba(x_224[train_ids])
+            prob_train_xgb_f = xgb_face.predict_proba(x_224[train_ids])
             
 
             preds = [prob_vgg_f, prob_svm_f, prob_xgb_f]
+            preds_train = [prob_train_vgg_f, prob_train_svm_f, prob_train_xgb_f]
             acc_ensem_f0,y_ensem_f0, rest_true_f0,focus_false_f0, focus_true_f0, rest_false_f0 = equal_wight_ensemble(preds, y_test_224)
-            acc_ensem_f,y_ensem_f, rest_true_f,focus_false_f, focus_true_f, rest_false_f = optimal_wight_ensemble(preds, y_test_224)
+            acc_ensem_f,y_ensem_f, rest_true_f,focus_false_f, focus_true_f, rest_false_f, weights_f = optimal_wight_ensemble_no_test_leak(preds_train, y_train_ensemble_224, preds, y_test_224)
+            print('face optimized ensemble weights learned from training fold:', weights_f)
 
 
             rest_pre_ensem_f0 = rest_true_f0/(rest_true_f0+rest_false_f0)
@@ -734,7 +840,11 @@ def main(args,results_face, results_ecg):
                               dataset_ecg_img, batch_size=batch_size_ecg, sampler=train_subsampler)
             
             testset_ecg = torch.utils.data.Subset(dataset_ecg_img, test_ids.tolist())
-            test_loader_ecg_img = torch.utils.data.DataLoader(testset_ecg, batch_size=batch_size_ecg, shuffle=False) 
+            test_loader_ecg_img = torch.utils.data.DataLoader(testset_ecg, batch_size=batch_size_ecg, shuffle=False)
+
+            # Ordered ECG-image training loader used only to learn ensemble weights.
+            ensemble_trainset_ecg_img = torch.utils.data.Subset(dataset_ecg_img, train_ids.tolist())
+            ensemble_train_loader_ecg_img = torch.utils.data.DataLoader(ensemble_trainset_ecg_img, batch_size=batch_size_ecg, shuffle=False)
             
                      
             method4 = 'Pretrained_VGG_ECG'
@@ -767,7 +877,12 @@ def main(args,results_face, results_ecg):
                               dataset_ecg, batch_size=batch_size_ecg, sampler=train_subsampler)
             
             testset_ecg2 = torch.utils.data.Subset(dataset_ecg, test_ids.tolist())
-            test_loader_ecg = torch.utils.data.DataLoader(testset_ecg2, batch_size=batch_size_ecg, shuffle=False)             
+            test_loader_ecg = torch.utils.data.DataLoader(testset_ecg2, batch_size=batch_size_ecg, shuffle=False)
+
+            # Ordered ECG-signal training loader used only to learn ensemble weights.
+            ensemble_trainset_ecg = torch.utils.data.Subset(dataset_ecg, train_ids.tolist())
+            ensemble_train_loader_ecg = torch.utils.data.DataLoader(ensemble_trainset_ecg, batch_size=batch_size_ecg, shuffle=False)
+            y_train_ensemble_ecg = y_ecg[train_ids]
             
             
             method5 = '1D_CNN_ECG'
@@ -863,15 +978,28 @@ def main(args,results_face, results_ecg):
             # print('y_test_ecg == y_cnn_e',y_test_ecg == y_cnn_e)
             # print('y_test_224 == y_test_ecg',y_test_224== y_test_ecg)
             
+            # Learn ECG ensemble weights from the outer training fold only.
+            _, prob_train_vgg_e = get_img_probs_for_ensemble(args, vgg_ecg, ensemble_train_loader_ecg_img)
+            _, prob_train_cnn_e = get_img_probs_for_ensemble(args, cnn_ecg, ensemble_train_loader_ecg)
+            if args.test:
+                with open(pk_svm_ecg, 'rb') as f3:
+                    svm_ecg = pickle.load(f3)
+                with open(pk_xgb_ecg, 'rb') as f4:
+                    xgb_ecg = pickle.load(f4)
+            prob_train_svm_e = svm_ecg.predict_proba(x_ecg[train_ids])
+            prob_train_xgb_e = xgb_ecg.predict_proba(x_ecg[train_ids])
+
             # preds = [prob_vgg_e, prob_cnn_e, prob_svm_e, prob_xgb_e]
             preds = [prob_vgg_e, prob_svm_e, prob_xgb_e]
+            preds_train = [prob_train_vgg_e, prob_train_svm_e, prob_train_xgb_e]
             acc_ensem_e0, y_ensem_e0, rest_true_e0, focus_false_e0, focus_true_e0, rest_false_e0 = equal_wight_ensemble(preds, y_test_224)           
             rest_pre_ensem_e0 = rest_true_e0/(rest_true_e0+rest_false_e0)
             focus_pre_ensem_e0 = focus_true_e0/(focus_true_e0+focus_false_e0)           
             rest_rec_ensem_e0 = rest_true_e0/(rest_true_e0+focus_false_e0)
             focus_rec_ensem_e0 = focus_true_e0/(focus_true_e0+rest_false_e0)
            
-            acc_ensem_e, y_ensem_e, rest_true_e, focus_false_e, focus_true_e, rest_false_e = optimal_wight_ensemble(preds, y_test_224)            
+            acc_ensem_e, y_ensem_e, rest_true_e, focus_false_e, focus_true_e, rest_false_e, weights_e = optimal_wight_ensemble_no_test_leak(preds_train, y_train_ensemble_ecg, preds, y_test_224)
+            print('ECG optimized ensemble weights learned from training fold:', weights_e)            
             rest_pre_ensem_e = rest_true_e/(rest_true_e+rest_false_e)
             focus_pre_ensem_e = focus_true_e/(focus_true_e+focus_false_e)           
             rest_rec_ensem_e = rest_true_e/(rest_true_e+focus_false_e)
@@ -924,7 +1052,9 @@ def main(args,results_face, results_ecg):
             ### ensemble on svm
             preds = [prob_svm_f, prob_svm_e]
             acc_ensem_s0, y_ensem_svm0, rest_true_svm0, focus_false_svm0, focus_true_svm0, rest_false_svm0 = equal_wight_ensemble(preds, y_test_224)
-            acc_ensem_s, y_ensem_svm, rest_true_svm, focus_false_svm, focus_true_svm, rest_false_svm = optimal_wight_ensemble(preds, y_test_224)  
+            preds_train = [prob_train_svm_f, prob_train_svm_e]
+            acc_ensem_s, y_ensem_svm, rest_true_svm, focus_false_svm, focus_true_svm, rest_false_svm, weights_svm = optimal_wight_ensemble_no_test_leak(preds_train, y_train_ensemble_224, preds, y_test_224)
+            print('SVM optimized ensemble weights learned from training fold:', weights_svm)  
 
             rest_pre_ensem_s0 = rest_true_svm0/(rest_true_svm0+rest_false_svm0)
             focus_pre_ensem_s0 = focus_true_svm0/(focus_true_svm0+focus_false_svm0)           
@@ -956,7 +1086,9 @@ def main(args,results_face, results_ecg):
             ### ensemble on xgboost
             preds = [prob_xgb_f, prob_xgb_e]
             acc_ensem_x0, y_ensem_xgb0, rest_true_xgb0, focus_false_xgb0, focus_true_xgb0, rest_false_xgb0 = equal_wight_ensemble(preds, y_test_224)
-            acc_ensem_x, y_ensem_xgb, rest_true_xgb, focus_false_xgb, focus_true_xgb, rest_false_xgb = optimal_wight_ensemble(preds, y_test_224) 
+            preds_train = [prob_train_xgb_f, prob_train_xgb_e]
+            acc_ensem_x, y_ensem_xgb, rest_true_xgb, focus_false_xgb, focus_true_xgb, rest_false_xgb, weights_xgb = optimal_wight_ensemble_no_test_leak(preds_train, y_train_ensemble_224, preds, y_test_224)
+            print('XGBoost optimized ensemble weights learned from training fold:', weights_xgb) 
             
         
             rest_pre_ensem_x0 = rest_true_xgb0/(rest_true_xgb0 +rest_false_xgb0)
@@ -989,7 +1121,9 @@ def main(args,results_face, results_ecg):
             ### ensemble on vgg
             preds = [prob_vgg_f, prob_vgg_e]
             acc_ensem_v0, y_ensem_vgg0, rest_true_vgg0, focus_false_vgg0, focus_true_vgg0, rest_false_vgg0 = equal_wight_ensemble(preds, y_test_224)
-            acc_ensem_v, y_ensem_vgg, rest_true_vgg, focus_false_vgg, focus_true_vgg, rest_false_vgg = optimal_wight_ensemble(preds, y_test_224)                        
+            preds_train = [prob_train_vgg_f, prob_train_vgg_e]
+            acc_ensem_v, y_ensem_vgg, rest_true_vgg, focus_false_vgg, focus_true_vgg, rest_false_vgg, weights_vgg = optimal_wight_ensemble_no_test_leak(preds_train, y_train_ensemble_224, preds, y_test_224)
+            print('VGG optimized ensemble weights learned from training fold:', weights_vgg)                        
             
         
             rest_pre_ensem_v0 = rest_true_vgg0/(rest_true_vgg0 +rest_false_vgg0)
@@ -1022,7 +1156,9 @@ def main(args,results_face, results_ecg):
             ### ensemble of vgg and 1d_cnn
             preds = [prob_vgg_f, prob_cnn_e]
             acc_ensem_v_c0, y_ensem_vgg_cnn0, rest_true_vgg_cnn0, focus_false_vgg_cnn0, focus_true_vgg_cnn0, rest_false_vgg_cnn0 = equal_wight_ensemble(preds, y_test_224)
-            acc_ensem_v_c, y_ensem_vgg_cnn, rest_true_vgg_cnn, focus_false_vgg_cnn, focus_true_vgg_cnn, rest_false_vgg_cnn = optimal_wight_ensemble(preds, y_test_224)                        
+            preds_train = [prob_train_vgg_f, prob_train_cnn_e]
+            acc_ensem_v_c, y_ensem_vgg_cnn, rest_true_vgg_cnn, focus_false_vgg_cnn, focus_true_vgg_cnn, rest_false_vgg_cnn, weights_vgg_cnn = optimal_wight_ensemble_no_test_leak(preds_train, y_train_ensemble_224, preds, y_test_224)
+            print('VGG + CNN optimized ensemble weights learned from training fold:', weights_vgg_cnn)                        
             
         
             rest_pre_ensem_v_c0 = rest_true_vgg_cnn0/(rest_true_vgg_cnn0 +rest_false_vgg_cnn0)
@@ -1056,7 +1192,9 @@ def main(args,results_face, results_ecg):
             # preds = [prob_vgg_f, prob_svm_f, prob_xgb_f, prob_vgg_e, prob_cnn_e, prob_svm_e, prob_xgb_e]
             preds = [prob_vgg_f, prob_svm_f, prob_xgb_f, prob_vgg_e, prob_svm_e, prob_xgb_e]
             acc_ensem_en0, y_ensem_en0, rest_true_en0, focus_false_en0, focus_true_en0, rest_false_en0 = equal_wight_ensemble(preds, y_test_224)
-            acc_ensem_en, y_ensem_en, rest_true_en, focus_false_en, focus_true_en, rest_false_en = optimal_wight_ensemble(preds, y_test_224) 
+            preds_train = [prob_train_vgg_f, prob_train_svm_f, prob_train_xgb_f, prob_train_vgg_e, prob_train_svm_e, prob_train_xgb_e]
+            acc_ensem_en, y_ensem_en, rest_true_en, focus_false_en, focus_true_en, rest_false_en, weights_all = optimal_wight_ensemble_no_test_leak(preds_train, y_train_ensemble_224, preds, y_test_224)
+            print('All-method optimized ensemble weights learned from training fold:', weights_all) 
             
         
             rest_pre_ensem_en0 = rest_true_en0/(rest_true_en0 +rest_false_en0)
